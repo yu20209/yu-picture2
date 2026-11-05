@@ -1,0 +1,9 @@
+停止命令
+Stop-Process -Id 5996,10164 -Force
+
+
+启动前端：
+cd D:\IDEA\workplace\yu-picture-master\yu-picture-frontend
+npm run dev
+
+http://localhost:5173/
