@@ -66,6 +66,7 @@ public class StpInterfaceImpl implements StpInterface {
     @Override
     public List<String> getPermissionList(Object loginId, String loginType) {
         // 判断 loginType，仅对类型为 "space" 进行权限校验
+        //第一步：判断当前是哪套账号体系。
         if (!StpKit.SPACE_TYPE.equals(loginType)) {
             return new ArrayList<>();
         }
@@ -77,7 +78,7 @@ public class StpInterfaceImpl implements StpInterface {
         if (isAllFieldsNull(authContext)) {
             return ADMIN_PERMISSIONS;
         }
-        // 获取 userId
+        // 第二步：获取当前登录用户。这里获取的是当前发起请求的李四，而不是请求参数中的张三。
         User loginUser = (User) StpKit.SPACE.getSessionByLoginId(loginId).get(USER_LOGIN_STATE);
         if (loginUser == null) {
             throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "用户未登录");
@@ -96,7 +97,7 @@ public class StpInterfaceImpl implements StpInterface {
             if (spaceUser == null) {
                 throw new BusinessException(ErrorCode.NOT_FOUND_ERROR, "未找到空间用户信息");
             }
-            // 取出当前登录用户对应的 spaceUser
+            // 第四步：查询当前操作者在这个空间中的成员记录。
             SpaceUser loginSpaceUser = spaceUserService.lambdaQuery()
                     .eq(SpaceUser::getSpaceId, spaceUser.getSpaceId())
                     .eq(SpaceUser::getUserId, userId)
@@ -156,6 +157,7 @@ public class StpInterfaceImpl implements StpInterface {
             if (spaceUser == null) {
                 return new ArrayList<>();
             }
+            // 第五步：返回当前登录者在这个空间中的角色和权限
             return spaceUserAuthManager.getPermissionsByRole(spaceUser.getSpaceRole());
         }
     }

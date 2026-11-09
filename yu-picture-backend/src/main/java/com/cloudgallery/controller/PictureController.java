@@ -147,6 +147,12 @@ public class PictureController {
         // 操作数据库
         boolean result = pictureService.updateById(picture);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        // 更新成功后失效对应作用域的图片列表缓存
+        pictureCacheManager.evictByPicture(oldPicture);
+        // 若本次更新变更了所属空间，新空间的列表缓存也要一并失效
+        if (picture.getSpaceId() != null && !picture.getSpaceId().equals(oldPicture.getSpaceId())) {
+            pictureCacheManager.evictBySpaceId(picture.getSpaceId());
+        }
         return ResultUtils.success(true);
     }
 

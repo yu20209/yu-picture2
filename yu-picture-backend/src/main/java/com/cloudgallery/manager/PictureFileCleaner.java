@@ -96,7 +96,16 @@ public class PictureFileCleaner {
         if (StrUtil.isBlank(url)) {
             return true;
         }
-        if (isReferenced(url, excludePictureId)) {
+        boolean referenced;
+        try {
+            referenced = isReferenced(url, excludePictureId);
+        } catch (Exception e) {
+            // 引用检查失败（如数据库异常）时无法确认文件是否仍被使用，保守起见不删除，进入补偿队列稍后重试
+            log.error("图片文件引用检查失败，已加入补偿队列，url = {}", url, e);
+            enqueue(url, e);
+            return false;
+        }
+        if (referenced) {
             return true;
         }
         try {
@@ -171,19 +180,20 @@ public class PictureFileCleaner {
     private void retryOne(PictureFileCleanup cleanup) {
         int retryCount = cleanup.getRetryCount() == null ? 0 : cleanup.getRetryCount() + 1;
         cleanup.setRetryCount(retryCount);
-        // 文件可能已被重新上传并被新记录引用，此时直接视为处理完成，避免误删
-        if (isReferenced(cleanup.getUrl(), null)) {
-            cleanup.setStatus(STATUS_SUCCESS);
-            cleanup.setErrorMsg("文件已被重新引用，跳过删除");
-            updateCleanup(cleanup);
-            return;
-        }
         try {
+            // 文件可能已被重新上传并被新记录引用，此时直接视为处理完成，避免误删
+            if (isReferenced(cleanup.getUrl(), null)) {
+                cleanup.setStatus(STATUS_SUCCESS);
+                cleanup.setErrorMsg("文件已被重新引用，跳过删除");
+                updateCleanup(cleanup);
+                return;
+            }
             localPictureManager.deletePictureFile(cleanup.getUrl());
             cleanup.setStatus(STATUS_SUCCESS);
             cleanup.setErrorMsg(null);
         } catch (Exception e) {
-            log.error("重试删除图片文件失败，url = {}", cleanup.getUrl(), e);
+            // 引用检查失败或文件删除失败：无法确认/完成清理，按退避策略稍后重试
+            log.error("重试清理图片文件失败，url = {}", cleanup.getUrl(), e);
             cleanup.setErrorMsg(StrUtil.maxLength(e.getMessage(), MAX_ERROR_MSG_LENGTH));
             if (retryCount >= MAX_RETRY_COUNT) {
                 cleanup.setStatus(STATUS_FAILED);

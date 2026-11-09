@@ -175,6 +175,42 @@ class PictureFileCleanerTest {
                 "下次重试应在 30 分钟左右，实际间隔毫秒数 = " + delayMillis);
     }
 
+    /**
+     * 引用检查抛异常（如数据库不可用）时不能误删文件，写入补偿记录稍后重试
+     */
+    @Test
+    void shouldEnqueueWhenReferenceCheckFails() {
+        when(pictureMapper.selectCount(any())).thenThrow(new RuntimeException("数据库连接失败"));
+
+        assertFalse(pictureFileCleaner.cleanIfUnreferenced(URL, null));
+
+        verify(localPictureManager, never()).deletePictureFile(any());
+        ArgumentCaptor<PictureFileCleanup> captor = ArgumentCaptor.forClass(PictureFileCleanup.class);
+        verify(pictureFileCleanupMapper).insert(captor.capture());
+        assertEquals(PictureFileCleaner.STATUS_PENDING, captor.getValue().getStatus());
+        assertTrue(captor.getValue().getErrorMsg().contains("数据库连接失败"));
+    }
+
+    /**
+     * 重试时引用检查抛异常：保持待处理状态，按退避策略安排下次重试
+     */
+    @Test
+    void retryReferenceCheckFailureShouldReschedule() {
+        PictureFileCleanup cleanup = newCleanup(0);
+        when(pictureFileCleanupMapper.selectList(any())).thenReturn(Collections.singletonList(cleanup));
+        when(pictureMapper.selectCount(any())).thenThrow(new RuntimeException("数据库连接失败"));
+
+        pictureFileCleaner.retryFailedCleanups();
+
+        verify(localPictureManager, never()).deletePictureFile(any());
+        ArgumentCaptor<PictureFileCleanup> captor = ArgumentCaptor.forClass(PictureFileCleanup.class);
+        verify(pictureFileCleanupMapper).updateById(captor.capture());
+        PictureFileCleanup updated = captor.getValue();
+        assertEquals(PictureFileCleaner.STATUS_PENDING, updated.getStatus());
+        assertEquals(1, updated.getRetryCount());
+        assertNotNull(updated.getNextRetryTime());
+    }
+
     private PictureFileCleanup newCleanup(int retryCount) {
         PictureFileCleanup cleanup = new PictureFileCleanup();
         cleanup.setId(1L);

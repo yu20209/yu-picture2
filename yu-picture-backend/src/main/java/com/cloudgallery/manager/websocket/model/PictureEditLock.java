@@ -24,6 +24,9 @@ public class PictureEditLock {
 
     /**
      * 最近一次活跃时间（毫秒），用于释放超时锁
+     * <p>
+     * 写入发生在 Disruptor 消费线程，读取发生在定时任务线程，
+     * volatile 保证跨线程的可见性与原子访问
      */
-    private Long lastActiveTime;
+    private volatile Long lastActiveTime;
 }
