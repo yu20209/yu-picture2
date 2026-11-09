@@ -74,15 +74,8 @@ public class SpaceController {
             throw new BusinessException(ErrorCode.PARAMS_ERROR);
         }
         User loginUser = userService.getLoginUser(request);
-        Long id = deleteRequest.getId();
-        // 判断是否存在
-        Space oldSpace = spaceService.getById(id);
-        ThrowUtils.throwIf(oldSpace == null, ErrorCode.NOT_FOUND_ERROR);
-        // 仅本人或者管理员可删除
-        spaceService.checkSpaceAuth(loginUser, oldSpace);
-        // 操作数据库
-        boolean result = spaceService.removeById(id);
-        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        // 删除空间时同步删除空间下的图片，并异步清理图片文件、失效缓存
+        spaceService.deleteSpace(deleteRequest.getId(), loginUser);
         return ResultUtils.success(true);
     }
 

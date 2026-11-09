@@ -75,4 +75,12 @@ public interface SpaceService extends IService<Space> {
      * @param space
      */
     void checkSpaceAuth(User loginUser, Space space);
+
+    /**
+     * 删除空间（同时删除空间下的图片，并异步清理图片文件）
+     *
+     * @param spaceId
+     * @param loginUser
+     */
+    void deleteSpace(long spaceId, User loginUser);
 }

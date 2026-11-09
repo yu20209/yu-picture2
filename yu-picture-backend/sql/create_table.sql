@@ -122,3 +122,18 @@ ALTER TABLE user
     ADD COLUMN vipExpireTime datetime NULL COMMENT '会员过期时间',
     ADD COLUMN vipCode varchar(128) NULL COMMENT '会员兑换码',
     ADD COLUMN vipNumber bigint NULL COMMENT '会员编号';
+
+-- 图片文件补偿清理表：文件删除失败时落库，由定时任务按退避策略重试
+create table if not exists picture_file_cleanup
+(
+    id            bigint auto_increment comment 'id' primary key,
+    url           varchar(1024)                      not null comment '待清理的文件地址',
+    retryCount    int      default 0                 not null comment '已重试次数',
+    status        tinyint  default 0                 not null comment '状态：0-待处理 1-清理成功 2-清理失败',
+    nextRetryTime datetime default CURRENT_TIMESTAMP not null comment '下次重试时间',
+    errorMsg      varchar(1024)                      null comment '失败原因',
+    createTime    datetime default CURRENT_TIMESTAMP not null comment '创建时间',
+    updateTime    datetime default CURRENT_TIMESTAMP not null on update CURRENT_TIMESTAMP comment '更新时间',
+    -- 索引设计
+    index idx_status_nextRetryTime (status, nextRetryTime) -- 提升定时任务扫描待重试记录的效率
+) comment '图片文件补偿清理' collate = utf8mb4_unicode_ci;

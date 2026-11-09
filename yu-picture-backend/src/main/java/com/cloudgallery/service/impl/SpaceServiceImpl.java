@@ -3,15 +3,20 @@ package com.cloudgallery.service.impl;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.ObjUtil;
 import cn.hutool.core.util.StrUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.cloudgallery.exception.BusinessException;
 import com.cloudgallery.exception.ErrorCode;
 import com.cloudgallery.exception.ThrowUtils;
+import com.cloudgallery.manager.PictureFileCleaner;
+import com.cloudgallery.manager.cache.PictureCacheManager;
 import com.cloudgallery.manager.sharding.DynamicShardingManager;
+import com.cloudgallery.mapper.PictureMapper;
 import com.cloudgallery.model.dto.space.SpaceAddRequest;
 import com.cloudgallery.model.dto.space.SpaceQueryRequest;
+import com.cloudgallery.model.entity.Picture;
 import com.cloudgallery.model.entity.Space;
 import com.cloudgallery.model.entity.SpaceUser;
 import com.cloudgallery.model.entity.User;
@@ -51,6 +56,15 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
 
     @Resource
     private TransactionTemplate transactionTemplate;
+
+    @Resource
+    private PictureMapper pictureMapper;
+
+    @Resource
+    private PictureFileCleaner pictureFileCleaner;
+
+    @Resource
+    private PictureCacheManager pictureCacheManager;
 
     // 为了方便部署，注释掉分表
 //    @Resource
@@ -273,6 +287,43 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space>
         if (!space.getUserId().equals(loginUser.getId()) && !userService.isAdmin(loginUser)) {
             throw new BusinessException(ErrorCode.NO_AUTH_ERROR);
         }
+    }
+
+    @Override
+    public void deleteSpace(long spaceId, User loginUser) {
+        ThrowUtils.throwIf(spaceId <= 0, ErrorCode.PARAMS_ERROR);
+        ThrowUtils.throwIf(loginUser == null, ErrorCode.NO_AUTH_ERROR);
+        // 判断空间是否存在
+        Space oldSpace = this.getById(spaceId);
+        ThrowUtils.throwIf(oldSpace == null, ErrorCode.NOT_FOUND_ERROR, "空间不存在");
+        // 校验权限
+        this.checkSpaceAuth(loginUser, oldSpace);
+        // 先查出空间下的全部图片，事务提交后再清理物理文件
+        List<Picture> pictureList = pictureMapper.selectList(
+                new LambdaQueryWrapper<Picture>().eq(Picture::getSpaceId, spaceId));
+        // 开启事务：删除空间 + 删除（逻辑删除）空间下的图片
+        transactionTemplate.execute(status -> {
+            boolean result = this.removeById(spaceId);
+            ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "删除空间失败");
+            if (CollUtil.isNotEmpty(pictureList)) {
+                List<Long> pictureIdList = pictureList.stream()
+                        .map(Picture::getId)
+                        .collect(Collectors.toList());
+                int deleteCount = pictureMapper.deleteBatchIds(pictureIdList);
+                ThrowUtils.throwIf(deleteCount <= 0, ErrorCode.OPERATION_ERROR, "删除空间下的图片失败");
+            }
+            return true;
+        });
+        // 事务提交后异步清理图片文件（先做引用检查，仍被其他记录引用的文件会保留）
+        pictureList.forEach(picture -> {
+            pictureFileCleaner.asyncCleanIfUnreferenced(picture.getUrl(), null);
+            String thumbnailUrl = picture.getThumbnailUrl();
+            if (StrUtil.isNotBlank(thumbnailUrl) && !StrUtil.equals(thumbnailUrl, picture.getUrl())) {
+                pictureFileCleaner.asyncCleanIfUnreferenced(thumbnailUrl, null);
+            }
+        });
+        // 失效该空间的图片列表缓存
+        pictureCacheManager.evictBySpaceId(spaceId);
     }
 }
 

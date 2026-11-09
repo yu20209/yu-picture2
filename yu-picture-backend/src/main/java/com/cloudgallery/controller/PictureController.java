@@ -1,11 +1,8 @@
 package com.cloudgallery.controller;
 
-import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import com.cloudgallery.annotation.AuthCheck;
 import com.cloudgallery.api.aliyunai.AliYunAiApi;
 import com.cloudgallery.api.aliyunai.model.CreateOutPaintingTaskResponse;
@@ -23,6 +20,7 @@ import com.cloudgallery.manager.auth.SpaceUserAuthManager;
 import com.cloudgallery.manager.auth.StpKit;
 import com.cloudgallery.manager.auth.annotation.SaSpaceCheckPermission;
 import com.cloudgallery.manager.auth.model.SpaceUserPermissionConstant;
+import com.cloudgallery.manager.cache.PictureCacheManager;
 import com.cloudgallery.model.dto.picture.*;
 import com.cloudgallery.model.entity.Picture;
 import com.cloudgallery.model.entity.Space;
@@ -35,20 +33,14 @@ import com.cloudgallery.service.SpaceService;
 import com.cloudgallery.service.UserService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.ValueOperations;
-import org.springframework.util.DigestUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
-import java.time.Duration;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 /**
  * @author CloudGallery
@@ -68,23 +60,13 @@ public class PictureController {
     private SpaceService spaceService;
 
     @Resource
-    private StringRedisTemplate stringRedisTemplate;
-
-    @Resource
     private AliYunAiApi aliYunAiApi;
 
     @Resource
     private SpaceUserAuthManager spaceUserAuthManager;
 
-    /**
-     * 本地缓存
-     */
-    private final Cache<String, String> LOCAL_CACHE = Caffeine.newBuilder()
-            .initialCapacity(1024)//初始容量为 1024。
-            .maximumSize(10_000L) // 最多保存 10000 条缓存记录
-            // 缓存 5 分钟后过期移除
-            .expireAfterWrite(Duration.ofMinutes(5))
-            .build();
+    @Resource
+    private PictureCacheManager pictureCacheManager;
 
     /**
      * 上传图片（可重新上传）
@@ -261,62 +243,13 @@ public class PictureController {
 //                throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "没有空间权限");
 //            }
         }
-        // 查询数据库
-          //Page 是 MyBatisPlus 提供的分页结果类型，Picture 表示其中的记录是图片实体。
-        Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
-                pictureService.getQueryWrapper(pictureQueryRequest));
-        // 获取封装类
-          //这里先把 Page<Picture> 转换成 Page<PictureVO>，再用 ResultUtils.success() 包装成统一响应，返回前端。
-        return ResultUtils.success(pictureService.getPictureVOPage(picturePage, request));
-    }
-
-    /**
-     * 分页获取图片列表（封装类，有缓存）
-     */
-    @Deprecated
-    @PostMapping("/list/page/vo/cache")
-    public BaseResponse<Page<PictureVO>> listPictureVOByPageWithCache(@RequestBody PictureQueryRequest pictureQueryRequest,
-                                                                      HttpServletRequest request) {
-        long current = pictureQueryRequest.getCurrent();
-        long size = pictureQueryRequest.getPageSize();
-        // 限制爬虫
-        ThrowUtils.throwIf(size > 20, ErrorCode.PARAMS_ERROR);
-        // 普通用户默认只能看到审核通过的数据
-        pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
-        // 查询缓存，缓存中没有，再查询数据库
-        // 构建缓存的 key
-        String queryCondition = JSONUtil.toJsonStr(pictureQueryRequest);
-        String hashKey = DigestUtils.md5DigestAsHex(queryCondition.getBytes());
-        String cacheKey = String.format("cloudgallery:listPictureVOByPage:%s", hashKey);
-        // 1. 先从本地缓存中查询
-        String cachedValue = LOCAL_CACHE.getIfPresent(cacheKey);
-        if (cachedValue != null) {
-            // 如果缓存命中，返回结果
-            Page<PictureVO> cachedPage = JSONUtil.toBean(cachedValue, Page.class);
-            return ResultUtils.success(cachedPage);
-        }
-        // 2. 本地缓存未命中，查询 Redis 分布式缓存
-        ValueOperations<String, String> opsForValue = stringRedisTemplate.opsForValue();
-        cachedValue = opsForValue.get(cacheKey);
-        if (cachedValue != null) {
-            // 如果缓存命中，更新本地缓存，返回结果
-            LOCAL_CACHE.put(cacheKey, cachedValue);
-            Page<PictureVO> cachedPage = JSONUtil.toBean(cachedValue, Page.class);
-            return ResultUtils.success(cachedPage);
-        }
-        // 3. 查询数据库
-        Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
-                pictureService.getQueryWrapper(pictureQueryRequest));
-        Page<PictureVO> pictureVOPage = pictureService.getPictureVOPage(picturePage, request);
-        // 4. 更新缓存
-        // 更新 Redis 缓存
-        String cacheValue = JSONUtil.toJsonStr(pictureVOPage);
-        // 设置缓存的过期时间，5 - 10 分钟过期，防止缓存雪崩
-        int cacheExpireTime = 300 + RandomUtil.randomInt(0, 300);
-        opsForValue.set(cacheKey, cacheValue, cacheExpireTime, TimeUnit.SECONDS);
-        // 写入本地缓存
-        LOCAL_CACHE.put(cacheKey, cacheValue);
-        // 获取封装类
+        // 查询缓存（多级缓存：Caffeine 本地 + Redis 分布式，未命中时由缓存管理器加载数据库）
+        Page<PictureVO> pictureVOPage = pictureCacheManager.getOrLoad(pictureQueryRequest,
+                () -> {
+                    Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
+                            pictureService.getQueryWrapper(pictureQueryRequest));
+                    return pictureService.getPictureVOPage(picturePage, request);
+                });
         return ResultUtils.success(pictureVOPage);
     }
 
@@ -356,6 +289,8 @@ public class PictureController {
         ThrowUtils.throwIf(pictureReviewRequest == null, ErrorCode.PARAMS_ERROR);
         User loginUser = userService.getLoginUser(request);
         pictureService.doPictureReview(pictureReviewRequest, loginUser);
+        // 审核结果会改变图片在公共图库/空间中的可见性，需要失效对应缓存
+        pictureCacheManager.evictByPicture(pictureService.getById(pictureReviewRequest.getId()));
         return ResultUtils.success(true);
     }
 

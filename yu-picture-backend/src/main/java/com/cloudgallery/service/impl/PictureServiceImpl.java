@@ -16,7 +16,8 @@ import com.cloudgallery.exception.BusinessException;
 import com.cloudgallery.exception.ErrorCode;
 import com.cloudgallery.exception.ThrowUtils;
 import com.cloudgallery.manager.FileManager;
-import com.cloudgallery.manager.LocalPictureManager;
+import com.cloudgallery.manager.PictureFileCleaner;
+import com.cloudgallery.manager.cache.PictureCacheManager;
 import com.cloudgallery.manager.upload.FilePictureUpload;
 import com.cloudgallery.manager.upload.PictureUploadTemplate;
 import com.cloudgallery.manager.upload.UrlPictureUpload;
@@ -42,7 +43,6 @@ import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -80,13 +80,16 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
     private UrlPictureUpload urlPictureUpload;
 
     @Resource
-    private LocalPictureManager localPictureManager;
-
-    @Resource
     private TransactionTemplate transactionTemplate;
 
     @Resource
     private AliYunAiApi aliYunAiApi;
+
+    @Resource
+    private PictureFileCleaner pictureFileCleaner;
+
+    @Resource
+    private PictureCacheManager pictureCacheManager;
 
     @Override
     public void validPicture(Picture picture) {
@@ -137,9 +140,11 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             pictureId = pictureUploadRequest.getId();
         }
         // 如果是更新，判断图片是否存在
+        // oldPicture 在事务之外也要使用（覆盖上传后清理旧文件），因此在此处先声明
+        Picture oldPicture = null;
         if (pictureId != null) {
             //getById() 是 MyBatis-Plus 提供的方法。它会根据传入的 ID 查询数据库。
-            Picture oldPicture = this.getById(pictureId);
+            oldPicture = this.getById(pictureId);
             ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR, "图片不存在");
             // 改为使用统一的权限校验
 //            // 仅本人或管理员可编辑图片
@@ -169,7 +174,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             // 空间
             uploadPathPrefix = String.format("space/%s", spaceId);
         }
-        // 根据 inputSource 的类型区分上传方式
+        // 根据 inputSource 的类型区分上传方式。多态写法
         PictureUploadTemplate pictureUploadTemplate = filePictureUpload;
         if (inputSource instanceof String) {
             pictureUploadTemplate = urlPictureUpload;
@@ -212,25 +217,43 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 开启事务
           //这里使用 finalSpaceId，是因为 Lambda 中引用的局部变量必须是 final 或事实上不可变的。
         Long finalSpaceId = spaceId;
-        transactionTemplate.execute(status -> {
-            // MyBatisPlus 的 saveOrUpdate() 可以根据实体的主键等情况，决定执行新增还是更新。
-            boolean result = this.saveOrUpdate(picture);
-            ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片上传失败，数据库操作失败");
-            if (finalSpaceId != null) {
-                // 更新空间的使用额度
-                  //totalSize：空间中图片占用的总大小。totalCount：空间中图片的数量。
-                boolean update = spaceService.lambdaUpdate()
-                          //Space::getId 是 Java 的方法引用写法，MyBatisPlus 可以通过它确定对应的实体字段。
-                        .eq(Space::getId, finalSpaceId)
-                        .setSql("totalSize = totalSize + " + picture.getPicSize())
-                        .setSql("totalCount = totalCount + 1")
-                        .update();
-                ThrowUtils.throwIf(!update, ErrorCode.OPERATION_ERROR, "额度更新失败");
+        try {
+            transactionTemplate.execute(status -> {
+                // MyBatisPlus 的 saveOrUpdate() 可以根据实体的主键等情况，决定执行新增还是更新。
+                boolean result = this.saveOrUpdate(picture);
+                ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片上传失败，数据库操作失败");
+                if (finalSpaceId != null) {
+                    // 更新空间的使用额度
+                    //totalSize：空间中图片占用的总大小。totalCount：空间中图片的数量。
+                    boolean update = spaceService.lambdaUpdate()
+                            //Space::getId 是 Java 的方法引用写法，MyBatisPlus 可以通过它确定对应的实体字段。
+                            .eq(Space::getId, finalSpaceId)
+                            .setSql("totalSize = totalSize + " + picture.getPicSize())
+                            .setSql("totalCount = totalCount + 1")
+                            .update();
+                    ThrowUtils.throwIf(!update, ErrorCode.OPERATION_ERROR, "额度更新失败");
+                }
+                return picture;
+            });
+        } catch (RuntimeException e) {
+            // 事务失败：数据库没有保存成功，本次新落盘的文件已成为孤儿文件，立即回收
+            pictureFileCleaner.cleanOrphanFile(picture.getUrl());
+            String newThumbnailUrl = picture.getThumbnailUrl();
+            if (StrUtil.isNotBlank(newThumbnailUrl) && !StrUtil.equals(newThumbnailUrl, picture.getUrl())) {
+                pictureFileCleaner.cleanOrphanFile(newThumbnailUrl);
             }
-            return picture;
-        });
-        // 可自行实现，如果是更新，可以清理图片资源
-        // this.clearPictureFile(oldPicture);
+            throw e;
+        }
+        // 上传/覆盖上传成功，失效对应作用域的图片列表缓存
+        pictureCacheManager.evictBySpaceId(finalSpaceId);
+        if (oldPicture != null) {
+            // 覆盖上传：旧文件已不再被当前记录引用，异步清理（若仍被其他记录引用则保留）
+            pictureFileCleaner.asyncCleanIfUnreferenced(oldPicture.getUrl(), oldPicture.getId());
+            String oldThumbnailUrl = oldPicture.getThumbnailUrl();
+            if (StrUtil.isNotBlank(oldThumbnailUrl) && !StrUtil.equals(oldThumbnailUrl, oldPicture.getUrl())) {
+                pictureFileCleaner.asyncCleanIfUnreferenced(oldThumbnailUrl, oldPicture.getId());
+            }
+        }
         return PictureVO.objToVo(picture);
     }
 
@@ -476,29 +499,6 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         return uploadCount;
     }
 
-    @Async
-    @Override
-    public void clearPictureFile(Picture oldPicture) {
-        // 判断改图片是否被多条记录使用
-        //获取图片 URL
-        String pictureUrl = oldPicture.getUrl();
-        // 查询有多少条记录使用这个图片
-        long count = this.lambdaQuery()
-                .eq(Picture::getUrl, pictureUrl)
-                .count();
-        // 只要还有其他记录使用这个 URL，就不能删除物理文件。
-        if (count > 0) {
-            return;
-        }
-        // 删除图片    LocalPictureManager：负责实际图片文件管理。
-        localPictureManager.deletePictureFile(pictureUrl);
-        // 删除缩略图 有才删除
-        String thumbnailUrl = oldPicture.getThumbnailUrl();
-        if (StrUtil.isNotBlank(thumbnailUrl)) {
-            localPictureManager.deletePictureFile(thumbnailUrl);
-        }
-    }
-
     @Override
     public void deletePicture(long pictureId, User loginUser) {
         ThrowUtils.throwIf(pictureId <= 0, ErrorCode.PARAMS_ERROR);
@@ -524,8 +524,14 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             }
             return true;
         });
-        // 异步清理文件
-        this.clearPictureFile(oldPicture);
+        // 异步清理文件：先做引用检查，若文件仍被其他记录引用则保留
+        pictureFileCleaner.asyncCleanIfUnreferenced(oldPicture.getUrl(), null);
+        String thumbnailUrl = oldPicture.getThumbnailUrl();
+        if (StrUtil.isNotBlank(thumbnailUrl) && !StrUtil.equals(thumbnailUrl, oldPicture.getUrl())) {
+            pictureFileCleaner.asyncCleanIfUnreferenced(thumbnailUrl, null);
+        }
+        // 删除成功后失效对应作用域的图片列表缓存
+        pictureCacheManager.evictBySpaceId(oldPicture.getSpaceId());
     }
 
     @Override
@@ -550,6 +556,8 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 操作数据库
         boolean result = this.updateById(picture);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        // 编辑后图片信息（名称、标签等）可能变化，失效对应作用域的图片列表缓存
+        pictureCacheManager.evictBySpaceId(oldPicture.getSpaceId());
     }
 
     @Override
@@ -661,6 +669,8 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 5. 操作数据库进行批量更新
         boolean result = this.updateBatchById(pictureList);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "批量编辑失败");
+        // 批量编辑后失效该空间的图片列表缓存
+        pictureCacheManager.evictBySpaceId(spaceId);
     }
 
     @Override
