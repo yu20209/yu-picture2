@@ -79,6 +79,9 @@ public class PictureEditHandler extends TextWebSocketHandler {
         super.afterConnectionEstablished(session);
         User user = (User) session.getAttributes().get("user");
         Long pictureId = (Long) session.getAttributes().get("pictureId");
+        // 将当前会话登记到该图片的会话集合中：
+        // putIfAbsent 原子地创建线程安全的集合，避免并发建立连接时集合被覆盖；
+        // 之后广播消息时即可遍历该集合，推送给同一图片的所有在线用户
         pictureSessions.putIfAbsent(pictureId, ConcurrentHashMap.newKeySet());
         pictureSessions.get(pictureId).add(session);
         PictureEditResponseMessage pictureEditResponseMessage = new PictureEditResponseMessage();
@@ -154,8 +157,18 @@ public class PictureEditHandler extends TextWebSocketHandler {
 
     /**
      * 退出编辑状态
+     * <p>用户主动退出编辑时释放该图片的编辑锁，并广播退出消息。
+     * 仅允许「持锁用户 + 持锁会话」本人释放，且通过条件删除保证并发安全：
+     * 若锁已被超时任务释放或被其他会话重新抢占，则直接忽略本次请求。
+     *
+     * @param pictureEditRequestMessage 前端发送的退出编辑请求消息
+     * @param session                   当前 WebSocket 会话
+     * @param user                      当前操作用户
+     * @param pictureId                 正在编辑的图片 ID
+     * @throws IOException 发送 WebSocket 消息失败时抛出
      */
-    public void handleExitEditMessage(PictureEditRequestMessage pictureEditRequestMessage, WebSocketSession session, User user, Long pictureId) throws IOException {
+    public void handleExitEditMessage(PictureEditRequestMessage pictureEditRequestMessage,
+                                      WebSocketSession session, User user, Long pictureId) throws IOException {
         PictureEditLock lock = pictureEditingUsers.get(pictureId);
         if (lock == null || session == null) {
             return;

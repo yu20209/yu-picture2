@@ -2,6 +2,7 @@ package com.cloudgallery.manager;
 
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.cloudgallery.mapper.PictureFileCleanupMapper;
 import com.cloudgallery.mapper.PictureMapper;
 import com.cloudgallery.model.entity.Picture;
@@ -39,14 +40,24 @@ public class PictureFileCleaner {
     public static final int STATUS_SUCCESS = 1;
 
     /**
-     * 清理失败（超过最大重试次数）
+     * 清理失败（异常任务区，超过最大重试次数后等待人工排查）
      */
     public static final int STATUS_FAILED = 2;
+
+    /**
+     * 处理中（已被某个消费者领取，避免重复处理）
+     */
+    public static final int STATUS_PROCESSING = 3;
 
     /**
      * 最大重试次数
      */
     private static final int MAX_RETRY_COUNT = 5;
+
+    /**
+     * 处理中状态超过该时长仍未结束，认为消费者异常退出，任务需重新放回待处理
+     */
+    private static final int PROCESSING_TIMEOUT_MINUTES = 10;
 
     /**
      * 每次重试的退避间隔（分钟），与 MAX_RETRY_COUNT 对应
@@ -150,10 +161,13 @@ public class PictureFileCleaner {
     }
 
     /**
-     * 定时扫描补偿表，重试删除失败的文件
+     * 定时消费补偿任务：先恢复卡死的任务，再逐条领取并处理
      */
     @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)
     public void retryFailedCleanups() {
+        // 1. 消费者可能在上一次处理中异常退出，先把长时间停留在「处理中」的任务放回待处理
+        recoverStuckTasks();
+        // 2. 取出到期的待处理任务
         LambdaQueryWrapper<PictureFileCleanup> wrapper = new LambdaQueryWrapper<PictureFileCleanup>()
                 .eq(PictureFileCleanup::getStatus, STATUS_PENDING)
                 .le(PictureFileCleanup::getNextRetryTime, new Date())
@@ -170,7 +184,50 @@ public class PictureFileCleaner {
             return;
         }
         for (PictureFileCleanup cleanup : cleanupList) {
+            // 3. 领取任务：抢占成功才处理，避免多个消费者（多线程/多实例）重复处理同一条任务
+            if (!claim(cleanup.getId())) {
+                continue;
+            }
             retryOne(cleanup);
+        }
+    }
+
+    /**
+     * 领取任务：通过条件更新把状态从待处理改为处理中，更新成功即代表领取成功
+     */
+    private boolean claim(Long id) {
+        LambdaUpdateWrapper<PictureFileCleanup> wrapper = new LambdaUpdateWrapper<PictureFileCleanup>()
+                .eq(PictureFileCleanup::getId, id)
+                .eq(PictureFileCleanup::getStatus, STATUS_PENDING)
+                .set(PictureFileCleanup::getStatus, STATUS_PROCESSING)
+                .set(PictureFileCleanup::getUpdateTime, new Date());
+        try {
+            return pictureFileCleanupMapper.update(null, wrapper) > 0;
+        } catch (Exception e) {
+            log.error("领取文件补偿任务失败，id = {}", id, e);
+            return false;
+        }
+    }
+
+    /**
+     * 恢复卡死任务：处理中超时说明消费者已异常退出，放回待处理并计入重试次数，避免无限循环
+     */
+    private void recoverStuckTasks() {
+        Date staleTime = new Date(System.currentTimeMillis()
+                - TimeUnit.MINUTES.toMillis(PROCESSING_TIMEOUT_MINUTES));
+        LambdaUpdateWrapper<PictureFileCleanup> wrapper = new LambdaUpdateWrapper<PictureFileCleanup>()
+                .eq(PictureFileCleanup::getStatus, STATUS_PROCESSING)
+                .le(PictureFileCleanup::getUpdateTime, staleTime)
+                .set(PictureFileCleanup::getStatus, STATUS_PENDING)
+                .set(PictureFileCleanup::getUpdateTime, new Date())
+                .setSql("retryCount = retryCount + 1");
+        try {
+            int count = pictureFileCleanupMapper.update(null, wrapper);
+            if (count > 0) {
+                log.warn("发现 {} 条处理中超时的文件补偿任务，已重新放回待处理", count);
+            }
+        } catch (Exception e) {
+            log.error("恢复超时文件补偿任务失败", e);
         }
     }
 
@@ -196,7 +253,10 @@ public class PictureFileCleaner {
             log.error("重试清理图片文件失败，url = {}", cleanup.getUrl(), e);
             cleanup.setErrorMsg(StrUtil.maxLength(e.getMessage(), MAX_ERROR_MSG_LENGTH));
             if (retryCount >= MAX_RETRY_COUNT) {
+                // 转入异常任务区：不再自动重试，保留记录与最后一次错误信息，等待人工排查
                 cleanup.setStatus(STATUS_FAILED);
+                log.error("文件补偿任务超过最大重试次数，已转入异常任务区等待人工排查，id = {}, url = {}, 错误 = {}",
+                        cleanup.getId(), cleanup.getUrl(), cleanup.getErrorMsg());
             } else {
                 long delayMinutes = RETRY_DELAY_MINUTES[Math.min(retryCount, RETRY_DELAY_MINUTES.length - 1)];
                 cleanup.setNextRetryTime(new Date(System.currentTimeMillis()
@@ -207,13 +267,13 @@ public class PictureFileCleaner {
     }
 
     /**
-     * 写入补偿记录（同一地址只保留一条待处理记录，避免重复排队）
+     * 写入补偿记录（同一地址在待处理/处理中时不再重复排队）
      */
     private void enqueue(String url, Exception e) {
         try {
             Long pendingCount = pictureFileCleanupMapper.selectCount(new LambdaQueryWrapper<PictureFileCleanup>()
                     .eq(PictureFileCleanup::getUrl, url)
-                    .eq(PictureFileCleanup::getStatus, STATUS_PENDING));
+                    .in(PictureFileCleanup::getStatus, STATUS_PENDING, STATUS_PROCESSING));
             if (pendingCount != null && pendingCount > 0) {
                 return;
             }

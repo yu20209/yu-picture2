@@ -1,8 +1,13 @@
 package com.cloudgallery.manager;
 
+import com.baomidou.mybatisplus.core.MybatisConfiguration;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.cloudgallery.mapper.PictureFileCleanupMapper;
 import com.cloudgallery.mapper.PictureMapper;
 import com.cloudgallery.model.entity.PictureFileCleanup;
+import org.apache.ibatis.builder.MapperBuilderAssistant;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -21,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -46,12 +52,58 @@ class PictureFileCleanerTest {
 
     private PictureFileCleaner pictureFileCleaner;
 
+    /**
+     * LambdaUpdateWrapper 解析字段名依赖 MyBatis-Plus 的表元数据，纯单测环境下需手动初始化
+     */
+    @BeforeAll
+    static void initTableInfo() {
+        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
+        assistant.setCurrentNamespace("com.cloudgallery.mapper.PictureFileCleanupMapper");
+        TableInfoHelper.initTableInfo(assistant, PictureFileCleanup.class);
+    }
+
     @BeforeEach
     void setUp() {
         pictureFileCleaner = new PictureFileCleaner();
         ReflectionTestUtils.setField(pictureFileCleaner, "localPictureManager", localPictureManager);
         ReflectionTestUtils.setField(pictureFileCleaner, "pictureMapper", pictureMapper);
         ReflectionTestUtils.setField(pictureFileCleaner, "pictureFileCleanupMapper", pictureFileCleanupMapper);
+        // 默认领取任务成功（条件更新影响 1 行）
+        when(pictureFileCleanupMapper.update(any(), any())).thenReturn(1);
+    }
+
+    /**
+     * 任务已被其他消费者领取时（条件更新影响 0 行）应当跳过，不重复处理
+     */
+    @Test
+    void shouldSkipWhenClaimFails() {
+        PictureFileCleanup cleanup = newCleanup(0);
+        when(pictureFileCleanupMapper.selectList(any())).thenReturn(Collections.singletonList(cleanup));
+        when(pictureMapper.selectCount(any())).thenReturn(0L);
+        // 恢复卡死任务与领取任务都未抢占到
+        when(pictureFileCleanupMapper.update(any(), any())).thenReturn(0);
+
+        pictureFileCleaner.retryFailedCleanups();
+
+        verify(localPictureManager, never()).deletePictureFile(any());
+        verify(pictureFileCleanupMapper, never()).updateById(any(PictureFileCleanup.class));
+    }
+
+    /**
+     * 每轮消费前都会先把超时停留在「处理中」的任务放回待处理
+     */
+    @Test
+    void shouldRecoverStuckTasksBeforeScan() {
+        when(pictureFileCleanupMapper.selectList(any())).thenReturn(Collections.emptyList());
+
+        pictureFileCleaner.retryFailedCleanups();
+
+        ArgumentCaptor<LambdaUpdateWrapper<PictureFileCleanup>> captor =
+                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
+        verify(pictureFileCleanupMapper).update(isNull(), captor.capture());
+        String sqlSet = captor.getValue().getSqlSet();
+        assertTrue(sqlSet.contains("status"), "恢复任务应重置状态");
+        assertTrue(sqlSet.contains("retryCount = retryCount + 1"), "恢复任务应计入重试次数，避免无限循环");
     }
 
     /**

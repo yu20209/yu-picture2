@@ -22,9 +22,9 @@ public class PictureEditEventDisruptorConfig {
         int bufferSize = 1024 * 256;
         // 创建 disruptor
         Disruptor<PictureEditEvent> disruptor = new Disruptor<>(
-                PictureEditEvent::new,
-                bufferSize,
-                ThreadFactoryBuilder.create().setNamePrefix("pictureEditEventDisruptor").build()
+                PictureEditEvent::new,//事件工厂，用于预创建事件对象。
+                bufferSize,//RingBuffer 容量
+                ThreadFactoryBuilder.create().setNamePrefix("pictureEditEventDisruptor").build()//创建消费者线程。
         );
         // 设置消费者
         disruptor.handleEventsWithWorkerPool(pictureEditEventWorkHandler);

@@ -98,6 +98,12 @@ public class PictureCacheManager {
     private StringRedisTemplate stringRedisTemplate;
 
     /**
+     * 缓存开关：压测时可通过 --picture.cache.enabled=false 关闭，用于对比优化前后的接口性能
+     */
+    @org.springframework.beans.factory.annotation.Value("${picture.cache.enabled:true}")
+    private boolean cacheEnabled;
+
+    /**
      * 读取缓存，未命中则重建（带互斥锁，避免热点 key 被同时击穿）
      *
      * @param pictureQueryRequest 查询条件（必须已经补齐审核状态、空间条件等）
@@ -105,19 +111,35 @@ public class PictureCacheManager {
      * @return 分页结果
      */
     public Page<PictureVO> getOrLoad(PictureQueryRequest pictureQueryRequest, Supplier<Page<PictureVO>> loader) {
+        // 压测对照：关闭缓存时直接查库
+        if (!cacheEnabled) {
+            return loader.get();
+        }
+        // 确定缓存作用域（公共图库或某个空间）
         String scope = resolveScope(pictureQueryRequest);
+        // 确定缓存版本号
         String version = getVersion(scope);
+        // 确定缓存 key
         String cacheKey = buildCacheKey(scope, version, pictureQueryRequest);
+        // 从缓存中查询
         Page<PictureVO> cachedPage = getFromCache(cacheKey);
+        // 任何一个缓存命中，直接返回
         if (cachedPage != null) {
             return cachedPage;
         }
         // 热点 key 互斥重建，拿不到锁的线程等待后重读缓存，避免全部打到数据库
+
+        // 构造锁的 key（基于缓存 key 派生，保证同一缓存只有一个线程重建）
         String lockKey = String.format(LOCK_KEY_TEMPLATE, cacheKey);
+        // 生成唯一锁值（UUID），用于释放锁时校验持有者，防止误删其他线程的锁
         String lockValue = UUID.randomUUID().toString();
+        // 尝试通过 SETNX 获取互斥锁；失败说明已有其他线程正在重建该缓存
         if (!tryLock(lockKey, lockValue)) {
+            // 未获得锁：自旋等待，重试读取缓存（期望持锁线程很快写完缓存）
             for (int i = 0; i < LOCK_RETRY_TIMES; i++) {
+                // 休眠 100ms，避免 CPU 空转
                 sleep(LOCK_WAIT_MILLIS);
+                // 重试读取缓存，看持锁线程是否已回填完成
                 cachedPage = getFromCache(cacheKey);
                 if (cachedPage != null) {
                     return cachedPage;
@@ -194,13 +216,15 @@ public class PictureCacheManager {
     }
 
     private Page<PictureVO> getFromCache(String cacheKey) {
-        // 1. 本地缓存
+        // 1. 本地缓存.根据 Key 从 Caffeine 本地缓存中获取数据
         String cachedValue = localCache.getIfPresent(cacheKey);
+        //命中
         if (cachedValue != null) {
             return deserialize(cachedValue);
         }
         // 2. Redis 分布式缓存
         try {
+            //StringRedisTemplate 是 Spring Data Redis 提供的操作 Redis 的工具。
             cachedValue = stringRedisTemplate.opsForValue().get(cacheKey);
         } catch (Exception e) {
             log.error("读取 Redis 图片列表缓存失败，cacheKey = {}", cacheKey, e);
@@ -209,7 +233,7 @@ public class PictureCacheManager {
         if (cachedValue == null) {
             return null;
         }
-        // 回填本地缓存
+        // 查到了，回填本地缓存Caffeine
         localCache.put(cacheKey, cachedValue);
         return deserialize(cachedValue);
     }

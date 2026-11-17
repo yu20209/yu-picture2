@@ -250,8 +250,9 @@ public class PictureController {
 //            }
         }
         // 查询缓存（多级缓存：Caffeine 本地 + Redis 分布式，未命中时由缓存管理器加载数据库）
+        //它负责判断缓存有没有数据，以及没有数据时如何查询数据库。
         Page<PictureVO> pictureVOPage = pictureCacheManager.getOrLoad(pictureQueryRequest,
-                () -> {
+                () -> {//传入一个 Lambda 表达式。如果缓存中没有数据，就执行我传给你的这段数据库查询代码。
                     Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
                             pictureService.getQueryWrapper(pictureQueryRequest));
                     return pictureService.getPictureVOPage(picturePage, request);

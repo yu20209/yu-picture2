@@ -129,7 +129,7 @@ create table if not exists picture_file_cleanup
     id            bigint auto_increment comment 'id' primary key,
     url           varchar(1024)                      not null comment '待清理的文件地址',
     retryCount    int      default 0                 not null comment '已重试次数',
-    status        tinyint  default 0                 not null comment '状态：0-待处理 1-清理成功 2-清理失败',
+    status        tinyint  default 0                 not null comment '状态：0-待处理 1-清理成功 2-清理失败（异常任务区） 3-处理中',
     nextRetryTime datetime default CURRENT_TIMESTAMP not null comment '下次重试时间',
     errorMsg      varchar(1024)                      null comment '失败原因',
     createTime    datetime default CURRENT_TIMESTAMP not null comment '创建时间',

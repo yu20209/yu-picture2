@@ -35,7 +35,7 @@ public class PictureFileCleanup implements Serializable {
     private Integer retryCount;
 
     /**
-     * 状态：0-待处理 1-清理成功 2-清理失败（超过最大重试次数）
+     * 状态：0-待处理 1-清理成功 2-清理失败（异常任务区） 3-处理中
      */
     private Integer status;
 
