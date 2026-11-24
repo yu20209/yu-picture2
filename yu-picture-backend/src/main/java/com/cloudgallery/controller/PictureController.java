@@ -41,6 +41,7 @@ import javax.servlet.http.HttpServletRequest;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 
 /**
  * @author CloudGallery
@@ -258,6 +259,14 @@ public class PictureController {
                     return pictureService.getPictureVOPage(picturePage, request);
                 });
         return ResultUtils.success(pictureVOPage);
+    }
+
+    /**
+     * 压测观测：读取并清空本节点的缓存命中统计（仅用于性能对比实验，不对外开放）
+     */
+    @GetMapping("/cache/stats")
+    public BaseResponse<Map<String, Object>> getCacheStats() {
+        return ResultUtils.success(pictureCacheManager.drainStats());
     }
 
     /**

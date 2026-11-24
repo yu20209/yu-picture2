@@ -98,10 +98,28 @@ public class PictureCacheManager {
     private StringRedisTemplate stringRedisTemplate;
 
     /**
-     * 缓存开关：压测时可通过 --picture.cache.enabled=false 关闭，用于对比优化前后的接口性能
+     * 缓存开关：可通过 --picture.cache.enabled=false 完全关闭缓存
      */
     @org.springframework.beans.factory.annotation.Value("${picture.cache.enabled:true}")
     private boolean cacheEnabled;
+
+    /**
+     * 缓存模式，用于压测分组对比：
+     * none  - 仅查询 MySQL（对照组 A，性能基准）
+     * redis - 仅 Redis 单级缓存（对照组 B，验证 Redis 收益）
+     * both  - Redis + Caffeine 两级缓存（对照组 C，默认值，线上配置）
+     */
+    @org.springframework.beans.factory.annotation.Value("${picture.cache.mode:both}")
+    private String cacheMode;
+
+    /**
+     * 以下计数器仅用于压测观测命中率，不参与业务逻辑
+     */
+    private final java.util.concurrent.atomic.AtomicLong statRequestCount = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong statL1HitCount = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong statL2HitCount = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong statLoadCount = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong statLockFallbackCount = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * 读取缓存，未命中则重建（带互斥锁，避免热点 key 被同时击穿）
@@ -111,8 +129,10 @@ public class PictureCacheManager {
      * @return 分页结果
      */
     public Page<PictureVO> getOrLoad(PictureQueryRequest pictureQueryRequest, Supplier<Page<PictureVO>> loader) {
-        // 压测对照：关闭缓存时直接查库
-        if (!cacheEnabled) {
+        statRequestCount.incrementAndGet();
+        // 压测对照 A 组：关闭缓存，直接查库
+        if (cacheDisabled()) {
+            statLoadCount.incrementAndGet();
             return loader.get();
         }
         // 确定缓存作用域（公共图库或某个空间）
@@ -122,10 +142,10 @@ public class PictureCacheManager {
         // 确定缓存 key
         String cacheKey = buildCacheKey(scope, version, pictureQueryRequest);
         // 从缓存中查询
-        Page<PictureVO> cachedPage = getFromCache(cacheKey);
+        CacheLookup hit = getFromCache(cacheKey);
         // 任何一个缓存命中，直接返回
-        if (cachedPage != null) {
-            return cachedPage;
+        if (hit.page != null) {
+            return hit.page;
         }
         // 热点 key 互斥重建，拿不到锁的线程等待后重读缓存，避免全部打到数据库
 
@@ -140,26 +160,66 @@ public class PictureCacheManager {
                 // 休眠 100ms，避免 CPU 空转
                 sleep(LOCK_WAIT_MILLIS);
                 // 重试读取缓存，看持锁线程是否已回填完成
-                cachedPage = getFromCache(cacheKey);
-                if (cachedPage != null) {
-                    return cachedPage;
+                hit = getFromCache(cacheKey);
+                if (hit.page != null) {
+                    return hit.page;
                 }
             }
             // 等待超时，直接查库兜底（不写缓存，避免与持锁线程互相覆盖）
+            statLoadCount.incrementAndGet();
+            statLockFallbackCount.incrementAndGet();
             return loader.get();
         }
         try {
             // 双重检查：可能刚拿到锁，缓存已经被上一个持锁线程重建好了
-            cachedPage = getFromCache(cacheKey);
-            if (cachedPage != null) {
-                return cachedPage;
+            hit = getFromCache(cacheKey);
+            if (hit.page != null) {
+                return hit.page;
             }
+            statLoadCount.incrementAndGet();
             Page<PictureVO> page = loader.get();
             putToCache(cacheKey, page);
             return page;
         } finally {
             unlock(lockKey, lockValue);
         }
+    }
+
+    /**
+     * 压测观测：读取并清空本节点的缓存统计
+     */
+    public java.util.Map<String, Object> drainStats() {
+        long requests = statRequestCount.getAndSet(0);
+        long l1 = statL1HitCount.getAndSet(0);
+        long l2 = statL2HitCount.getAndSet(0);
+        long loads = statLoadCount.getAndSet(0);
+        long fallback = statLockFallbackCount.getAndSet(0);
+        java.util.Map<String, Object> stats = new java.util.LinkedHashMap<>();
+        stats.put("mode", cacheDisabled() ? "none" : cacheMode);
+        stats.put("requests", requests);
+        stats.put("l1Hits", l1);
+        stats.put("l2Hits", l2);
+        stats.put("dbLoads", loads);
+        stats.put("lockFallbacks", fallback);
+        stats.put("l1HitRate", requests == 0 ? 0 : Math.round(l1 * 10000.0 / requests) / 100.0);
+        stats.put("l2HitRate", requests == 0 ? 0 : Math.round(l2 * 10000.0 / requests) / 100.0);
+        stats.put("totalHitRate", requests == 0 ? 0
+                : Math.round((l1 + l2) * 10000.0 / requests) / 100.0);
+        return stats;
+    }
+
+    /**
+     * 是否走 Redis（A 组直接查库）
+     */
+    private boolean cacheDisabled() {
+        return !cacheEnabled || "none".equalsIgnoreCase(cacheMode);
+    }
+
+    /**
+     * 是否启用 Caffeine 本地缓存（B 组关闭，只保留 Redis）
+     */
+    private boolean localCacheEnabled() {
+        return !"redis".equalsIgnoreCase(cacheMode);
     }
 
     /**
@@ -215,27 +275,54 @@ public class PictureCacheManager {
         return String.format("%s:%s:%s:%s", CACHE_KEY_PREFIX, scope, version, hashKey);
     }
 
-    private Page<PictureVO> getFromCache(String cacheKey) {
-        // 1. 本地缓存.根据 Key 从 Caffeine 本地缓存中获取数据
-        String cachedValue = localCache.getIfPresent(cacheKey);
-        //命中
-        if (cachedValue != null) {
-            return deserialize(cachedValue);
+    private CacheLookup getFromCache(String cacheKey) {
+        // 1. 本地缓存（B 组对照组会跳过）
+        if (localCacheEnabled()) {
+            String localValue = localCache.getIfPresent(cacheKey);
+            if (localValue != null) {
+                Page<PictureVO> localPage = deserialize(localValue);
+                if (localPage != null) {
+                    statL1HitCount.incrementAndGet();
+                    return new CacheLookup(localPage, 1);
+                }
+            }
         }
         // 2. Redis 分布式缓存
+        String cachedValue;
         try {
-            //StringRedisTemplate 是 Spring Data Redis 提供的操作 Redis 的工具。
             cachedValue = stringRedisTemplate.opsForValue().get(cacheKey);
         } catch (Exception e) {
             log.error("读取 Redis 图片列表缓存失败，cacheKey = {}", cacheKey, e);
-            return null;
+            return CacheLookup.miss();
         }
         if (cachedValue == null) {
-            return null;
+            return CacheLookup.miss();
         }
-        // 查到了，回填本地缓存Caffeine
-        localCache.put(cacheKey, cachedValue);
-        return deserialize(cachedValue);
+        Page<PictureVO> cachedPage = deserialize(cachedValue);
+        if (cachedPage == null) {
+            return CacheLookup.miss();
+        }
+        // 查到了，回填本地缓存 Caffeine
+        if (localCacheEnabled()) {
+            localCache.put(cacheKey, cachedValue);
+        }
+        statL2HitCount.incrementAndGet();
+        return new CacheLookup(cachedPage, 2);
+    }
+
+    /**
+     * 缓存查询结果：page 为空表示未命中，level 标识命中层级（1=本地，2=Redis）
+     */
+    @lombok.AllArgsConstructor
+    private static class CacheLookup {
+
+        private final Page<PictureVO> page;
+
+        private final int level;
+
+        static CacheLookup miss() {
+            return new CacheLookup(null, 0);
+        }
     }
 
     private void putToCache(String cacheKey, Page<PictureVO> page) {
@@ -254,7 +341,10 @@ public class PictureCacheManager {
             log.error("写入 Redis 图片列表缓存失败，cacheKey = {}", cacheKey, e);
             return;
         }
-        localCache.put(cacheKey, cacheValue);
+        // B 组（仅 Redis）不回填本地缓存
+        if (localCacheEnabled()) {
+            localCache.put(cacheKey, cacheValue);
+        }
     }
 
     private boolean tryLock(String lockKey, String lockValue) {
